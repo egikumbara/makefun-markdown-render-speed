@@ -18,6 +18,9 @@ function isWSCode(c) {
 }
 // Unicode punctuation: ASCII punct or general category P / S.
 const punctRe = /[\p{P}\p{S}]/u;
+// Chars that make esc/escRaw/escHrefKeep do any work; a string without
+// them passes through unchanged, so a C++ regex test can skip the JS loop.
+const ESC_RE = /[&<>"']/;
 const punctCache = new Map();
 function isPunctStr(ch) {
   if (ch.length === 1) {
@@ -36,6 +39,7 @@ function isPunctCode(c) {
 // ---------- escaping ----------
 // Plain escaper: escapes & < > " ' with NO entity handling (for code content).
 function escRaw(s) {
+  if (!ESC_RE.test(s)) return s;
   let out = '';
   let start = 0;
   for (let i = 0; i < s.length; i++) {
@@ -59,6 +63,7 @@ function escRaw(s) {
 // Escaper for hrefs: valid entities (named AND numeric) pass through
 // literally (no decoding); bare & becomes &amp;.
 function escHrefKeep(s) {
+  if (!ESC_RE.test(s)) return s;
   let out = '';
   let start = 0;
   for (let i = 0; i < s.length; i++) {
@@ -93,6 +98,7 @@ function escHrefKeep(s) {
   return out;
 }
 function esc(s) {
+  if (!ESC_RE.test(s)) return s;
   let out = '';
   let start = 0;
   for (let i = 0; i < s.length; i++) {
@@ -631,21 +637,21 @@ function parseTitleClose(src, p, dest) {
 function computeEmMask(src, defs) {
   const n = src.length;
   if (n === 0) return null;
-  let hasBt = false, hasBr = false, hasDelim = false;
-  for (let i = 0; i < n; i++) {
-    const c = src.charCodeAt(i);
-    if (c === 96) hasBt = true;
-    else if (c === 91) hasBr = true;
-    else if (c === 42 || c === 95 || c === 126) hasDelim = true;
-  }
-  if (!hasDelim || (!hasBt && !hasBr)) return null;
-  const masked = new Uint8Array(n);
-  let anyMasked = false;
-  // neutralized copy, allocated lazily on the first neutralization
-  // (many paragraphs need none, and split+join over a 100KB paragraph
-  // is pure overhead then).
-  let ch = null;
-  const neut = (pos) => { if (!ch) ch = src.split(''); ch[pos] = '+'; };
+  // Pre-scan with C++ indexOf: far cheaper than a JS char loop over every
+  // inline source, most of which need no mask at all.
+  if (src.indexOf('*') < 0 && src.indexOf('_') < 0 && src.indexOf('~') < 0) return null;
+  if (src.indexOf('`') < 0 && src.indexOf('[') < 0) return null;
+  // Neutralized positions (escapes + inner backticks), allocated lazily.
+  // The neutralized source neu[p] is '+' iff neut[p] is set, else src[p];
+  // step B reads it through ncc/nSlice instead of materializing a string
+  // (no split('') + join('') over the whole paragraph).
+  let neut = null;
+  const mark = (pos) => { if (!neut) neut = new Uint8Array(n); neut[pos] = 1; };
+  let masked = null; // allocated on first masked write
+  const setMask = (a, b) => {
+    if (!masked) masked = new Uint8Array(n);
+    for (let q = a; q < b; q++) masked[q] = 1;
+  };
   // --- Step A: code spans, left-to-right scan of the raw source ---
   // At each position, in order: an escape `\<punct>` is neutralized
   // (both chars become '+'); a backtick run tries to pair with the first
@@ -656,12 +662,21 @@ function computeEmMask(src, defs) {
   // position, so an escaped backtick is only neutralized when no earlier
   // opener has already consumed it as a closer. Conversely a `\`` with
   // no earlier opener (doc-02) is neutralized and never opens a span.
+  // The scan jumps between backtick runs and backslashes with indexOf:
+  // positions holding neither can neither open a span nor be an escape.
   const spans = [];
   let i = 0;
   while (i < n) {
+    const nb = src.indexOf('`', i);
+    const ns = src.indexOf('\\', i);
+    let j = -1;
+    if (nb >= 0 && ns >= 0) j = nb < ns ? nb : ns;
+    else j = nb >= 0 ? nb : ns;
+    if (j < 0) break;
+    i = j;
     const c = src.charCodeAt(i);
     if (c === 92 && i + 1 < n && isPunctStr(src[i + 1])) {
-      neut(i); neut(i + 1);
+      mark(i); mark(i + 1);
       i += 2;
       continue;
     }
@@ -669,43 +684,57 @@ function computeEmMask(src, defs) {
     let k = i;
     while (k < n && src.charCodeAt(k) === 96) k++;
     const len = k - i;
-    let m = k, found = -1;
-    while (m < n) {
-      if (src.charCodeAt(m) === 96) {
-        let e = m;
-        while (e < n && src.charCodeAt(e) === 96) e++;
-        if (e - m === len && (e >= n || src.charCodeAt(e) !== 96) && m > k) { found = m; break; }
-        m = e;
-      } else m++;
+    let m = src.indexOf('`', k);
+    let found = -1;
+    while (m >= 0) {
+      let e = m;
+      while (e < n && src.charCodeAt(e) === 96) e++;
+      if (e - m === len && (e >= n || src.charCodeAt(e) !== 96) && m > k) { found = m; break; }
+      m = src.indexOf('`', e);
     }
     if (found >= 0) {
       spans.push([i, found + len]);
-      for (let q = k; q < found; q++) if (src.charCodeAt(q) === 96) neut(q);
+      for (let q = k; q < found; q++) if (src.charCodeAt(q) === 96) mark(q);
       i = found + len;
     } else {
       i = k;
     }
   }
-  const neu = ch ? ch.join('') : src;
-  // Match a label at neu[pos] === '[' on the neutralized source; returns
+  // Neutralized-source readers for step B.
+  const ncc = neut
+    ? (p) => (neut[p] ? 43 : src.charCodeAt(p))
+    : (p) => src.charCodeAt(p);
+  const nSlice = neut
+    ? (a, b) => {
+        for (let q = a; q < b; q++) {
+          if (neut[q]) {
+            let s = src.slice(a, q);
+            for (let r = q; r < b; r++) s += neut[r] ? '+' : src[r];
+            return s;
+          }
+        }
+        return src.slice(a, b);
+      }
+    : (a, b) => src.slice(a, b);
+  // Match a label at ncc(pos) === '[' on the neutralized source; returns
   // the index of the closing ']' or -1. Label holds plain chars (not [ ]
   // `) and code spans (run + non-backtick content + same run).
   const matchLabel = (pos) => {
     let p = pos + 1;
     while (p < n) {
-      const c = neu.charCodeAt(p);
+      const c = ncc(p);
       if (c === 93) return p;
       if (c === 91 || c === 92) return -1;
       if (c === 96) {
         let k = p;
-        while (k < n && neu.charCodeAt(k) === 96) k++;
+        while (k < n && ncc(k) === 96) k++;
         const len = k - p;
         let m = k;
-        while (m < n && neu.charCodeAt(m) !== 96) m++;
+        while (m < n && ncc(m) !== 96) m++;
         if (m >= n) return -1;
         let e = m;
-        while (e < n && neu.charCodeAt(e) === 96) e++;
-        if (e - m !== len || (e < n && neu.charCodeAt(e) === 96)) return -1;
+        while (e < n && ncc(e) === 96) e++;
+        if (e - m !== len || (e < n && ncc(e) === 96)) return -1;
         p = e;
         continue;
       }
@@ -713,12 +742,12 @@ function computeEmMask(src, defs) {
     }
     return -1;
   };
-  // Match the (dest) group at neu[pos] === '('; returns index after ')' or -1.
+  // Match the (dest) group at ncc(pos) === '('; returns index after ')' or -1.
   // marked's pattern allows nested parens only one level deep.
   const matchParen = (pos) => {
     let p = pos + 1, depth = 1;
     while (p < n) {
-      const c = neu.charCodeAt(p);
+      const c = ncc(p);
       if (c === 92) { p += 2; continue; }
       if (c === 40) { depth++; if (depth > 2) return -1; }
       else if (c === 41) { depth--; if (depth === 0) return p + 1; }
@@ -729,41 +758,42 @@ function computeEmMask(src, defs) {
   // --- Step B: links on the neutralized source ---
   // A '[' inside a code span (step A) is already consumed by that span:
   // skip over spans, exactly as blockSkip's left-to-right alternation does.
-  let j = 0, si = 0;
-  while (j < n) {
+  // Jump between '[' candidates with indexOf instead of scanning each char.
+  let j = src.indexOf('[', 0);
+  let si = 0;
+  while (j >= 0) {
     while (si < spans.length && spans[si][1] <= j) si++;
-    if (si < spans.length && spans[si][0] <= j && j < spans[si][1]) { j = spans[si][1]; continue; }
-    if (neu.charCodeAt(j) !== 91) { j++; continue; }
+    if (si < spans.length && spans[si][0] <= j && j < spans[si][1]) {
+      j = src.indexOf('[', spans[si][1]);
+      continue;
+    }
+    if (ncc(j) !== 91) { j = src.indexOf('[', j + 1); continue; } // escaped '[': neutralized
     const close = matchLabel(j);
-    if (close < 0) { j++; continue; }
+    if (close < 0) { j = src.indexOf('[', j + 1); continue; }
     const after = close + 1;
     let end = -1;
-    if (after < n && neu.charCodeAt(after) === 40) {
+    if (after < n && ncc(after) === 40) {
       end = matchParen(after);
-    } else if (after < n && neu.charCodeAt(after) === 91) {
+    } else if (after < n && ncc(after) === 91) {
       const close2 = matchLabel(after);
       if (close2 >= 0) {
-        const ref = close2 === after + 1 ? neu.slice(j + 1, close) : neu.slice(after + 1, close2);
+        const ref = close2 === after + 1 ? nSlice(j + 1, close) : nSlice(after + 1, close2);
         if (ref.length > 0 && defs && defs[normLabel(ref)]) end = close2 + 1;
       }
     } else {
-      const label = neu.slice(j + 1, close);
+      const label = nSlice(j + 1, close);
       if (label.length > 0 && defs && defs[normLabel(label)]) end = after;
     }
     if (end >= 0) {
-      for (let q = j; q < end; q++) masked[q] = 1;
-      anyMasked = true;
-      j = end;
+      setMask(j, end);
+      j = src.indexOf('[', end);
     } else {
-      j++;
+      j = src.indexOf('[', j + 1);
     }
   }
   // code spans mask their whole range
-  for (let s = 0; s < spans.length; s++) {
-    for (let q = spans[s][0]; q < spans[s][1]; q++) masked[q] = 1;
-    anyMasked = true;
-  }
-  return anyMasked ? masked : null;
+  for (let s = 0; s < spans.length; s++) setMask(spans[s][0], spans[s][1]);
+  return masked;
 }
 
 // ---------- inline parsing ----------
@@ -813,8 +843,35 @@ function isOnlyTag(src, i, end) {
   return true;
 }
 
+// Chars the inline scan loop can act on (everything else is plain text
+// that is only flushed, never inspected): backslash, backtick, emphasis
+// delimiters, '[', '!', '<', newline. Bare-URL letters (w/h/f) are NOT
+// in this set: matchExtUrl can only succeed at a www. / http(s):// /
+// ftp:// start, found separately by URL_RE.
+// Any char that can make parseInline do more than escape the text:
+// backslash, backtick, emphasis, '[', '!', '<', newline, '@' (email).
+// (Bare URLs are gated separately on '://' / 'www.' below.)
+const PLAIN_RE = /[\\`*_~\[!<\n@]/;
+const SPECIAL_RE = /[\\`*_~\[!<\n]/g;
+const URL_RE = /(?:www\.|https?:\/\/|ftp:\/\/)/gi;
+
 function parseInline(src, defs, inLink, noHtml) {
+  // Plain text: no construct can form (no specials, no '@', no URL
+  // start), so the output is just the escaped text. Skips findEmails,
+  // the mask, the scan loop, processDelims and the node list.
+  if (!PLAIN_RE.test(src) && src.indexOf('://') < 0 && src.indexOf('www.') < 0) return esc(src);
   const emails = findEmails(src);
+  // Bare-URL start candidates (www. / http(s):// / ftp://, any case):
+  // matchExtUrl can only succeed at these positions, so the scan loop
+  // need not visit every 'w'/'h'/'f'. Skipped inside link text, where
+  // bare autolinks never form.
+  const urls = [];
+  let urlIdx = 0;
+  if (!inLink && (src.indexOf('://') >= 0 || src.indexOf('www.') >= 0)) {
+    URL_RE.lastIndex = 0;
+    let um;
+    while ((um = URL_RE.exec(src)) !== null) urls.push(um.index);
+  }
   const emMask = computeEmMask(src, defs); // 1 = hidden by marked's masked source
   const nodes = [];
   const delims = [];
@@ -828,6 +885,21 @@ function parseInline(src, defs, inLink, noHtml) {
   while (i < n) {
     // skip emails already passed (e.g. one consumed inside a <...> tag/link)
     while (emailIdx < emails.length && emails[emailIdx] < i) emailIdx += 2;
+    // Jump to the next position where the loop can act: the next special
+    // char, the next bare-URL candidate, or the next email start. Plain
+    // text between such positions is only flushed, never inspected.
+    {
+      let target = n;
+      SPECIAL_RE.lastIndex = i;
+      const sm = SPECIAL_RE.exec(src);
+      if (sm) target = sm.index;
+      if (!inLink && !suppressBareAutolink) {
+        while (urlIdx < urls.length && urls[urlIdx] < i) urlIdx++;
+        if (urlIdx < urls.length && urls[urlIdx] < target) target = urls[urlIdx];
+        if (emailIdx < emails.length && emails[emailIdx] < target) target = emails[emailIdx];
+      }
+      if (target > i) { i = target; if (i >= n) break; }
+    }
     if (!inLink && !suppressBareAutolink && emailIdx < emails.length && emails[emailIdx] === i) {
       const eEnd = emails[emailIdx + 1];
       flushText(i);
